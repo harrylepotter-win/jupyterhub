@@ -536,7 +536,7 @@ class BaseHandler(RequestHandler):
         if self.subdomain_host:
             kwargs['domain'] = self.domain
 
-	kwargs['SameSite'] = 'None'
+        kwargs['SameSite'] = 'None'
         kwargs.update(self.settings.get('cookie_options', {}))
         kwargs.update(overrides)
 
