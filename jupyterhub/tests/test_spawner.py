@@ -21,6 +21,7 @@ from ..objects import Server
 from ..spawner import LocalProcessSpawner
 from ..spawner import Spawner
 from ..user import User
+from ..utils import AnyTimeoutError
 from ..utils import new_token
 from ..utils import url_path_join
 from .mocking import public_url
@@ -95,7 +96,7 @@ async def wait_for_spawner(spawner, timeout=10):
         assert status is None
         try:
             await wait()
-        except TimeoutError:
+        except AnyTimeoutError:
             continue
         else:
             break
@@ -258,12 +259,11 @@ async def test_shell_cmd(db, tmpdir, request):
 
 
 def test_inherit_overwrite():
-    """On 3.6+ we check things are overwritten at import time"""
-    if sys.version_info >= (3, 6):
-        with pytest.raises(NotImplementedError):
+    """We check things are overwritten at import time"""
+    with pytest.raises(NotImplementedError):
 
-            class S(Spawner):
-                pass
+        class S(Spawner):
+            pass
 
 
 def test_inherit_ok():

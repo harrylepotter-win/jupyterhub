@@ -16,10 +16,12 @@ what happens under-the-hood when you deploy and configure your JupyterHub.
    proxy
    separate-proxy
    rest
+   rest-api
    server-api
    monitoring
    database
    templates
+   api-only
    ../events/index
    config-user-env
    config-examples

@@ -28,7 +28,7 @@ def test_orm_roles(db):
         user_role = orm.Role(name='user', scopes=['self'])
         db.add(user_role)
     if not token_role:
-        token_role = orm.Role(name='token', scopes=['all'])
+        token_role = orm.Role(name='token', scopes=['inherit'])
         db.add(token_role)
     if not service_role:
         service_role = orm.Role(name='service', scopes=[])
@@ -182,6 +182,8 @@ def test_orm_roles_delete_cascade(db):
                 'admin:users',
                 'admin:auth_state',
                 'users',
+                'delete:users',
+                'list:users',
                 'read:users',
                 'users:activity',
                 'read:users:name',
@@ -194,6 +196,7 @@ def test_orm_roles_delete_cascade(db):
             ['users'],
             {
                 'users',
+                'list:users',
                 'read:users',
                 'users:activity',
                 'read:users:name',
@@ -216,6 +219,8 @@ def test_orm_roles_delete_cascade(db):
             {
                 'admin:groups',
                 'groups',
+                'delete:groups',
+                'list:groups',
                 'read:groups',
                 'read:roles:groups',
                 'read:groups:name',
@@ -226,6 +231,8 @@ def test_orm_roles_delete_cascade(db):
             {
                 'admin:groups',
                 'groups',
+                'delete:groups',
+                'list:groups',
                 'read:groups',
                 'read:roles:groups',
                 'read:groups:name',
@@ -362,7 +369,7 @@ async def test_creating_roles(app, role, role_def, response_type, response):
             'info',
             app_log.info('Role user scopes attribute has been changed'),
         ),
-        ('non-existing', 'test-role2', 'error', NameError),
+        ('non-existing', 'test-role2', 'error', KeyError),
         ('default', 'user', 'error', ValueError),
     ],
 )
@@ -403,9 +410,9 @@ async def test_delete_roles(db, role_type, rolename, response_type, response):
             },
             'existing',
         ),
-        ({'name': 'test-scopes-2', 'scopes': ['uses']}, NameError),
-        ({'name': 'test-scopes-3', 'scopes': ['users:activities']}, NameError),
-        ({'name': 'test-scopes-4', 'scopes': ['groups!goup=class-A']}, NameError),
+        ({'name': 'test-scopes-2', 'scopes': ['uses']}, KeyError),
+        ({'name': 'test-scopes-3', 'scopes': ['users:activities']}, KeyError),
+        ({'name': 'test-scopes-4', 'scopes': ['groups!goup=class-A']}, KeyError),
     ],
 )
 async def test_scope_existence(tmpdir, request, role, response):
@@ -424,7 +431,7 @@ async def test_scope_existence(tmpdir, request, role, response):
         assert added_role is not None
         assert added_role.scopes == role['scopes']
 
-    elif response == NameError:
+    elif response == KeyError:
         with pytest.raises(response):
             roles.create_role(db, role)
         added_role = orm.Role.find(db, role['name'])
@@ -571,7 +578,7 @@ async def test_load_roles_groups(tmpdir, request):
             'name': 'head',
             'description': 'Whole user access',
             'scopes': ['users', 'admin:users'],
-            'groups': ['group3'],
+            'groups': ['group3', "group4"],
         },
     ]
     kwargs = {'load_groups': groups_to_load, 'load_roles': roles_to_load}
@@ -591,11 +598,13 @@ async def test_load_roles_groups(tmpdir, request):
     group1 = orm.Group.find(db, name='group1')
     group2 = orm.Group.find(db, name='group2')
     group3 = orm.Group.find(db, name='group3')
+    group4 = orm.Group.find(db, name='group4')
 
     # test group roles
     assert group1.roles == []
     assert group2 in assist_role.groups
     assert group3 in head_role.groups
+    assert group4 in head_role.groups
 
     # delete the test roles
     for role in roles_to_load:
@@ -654,11 +663,11 @@ async def test_load_roles_user_tokens(tmpdir, request):
     "headers, rolename, scopes, status",
     [
         # no role requested - gets default 'token' role
-        ({}, None, None, 200),
+        ({}, None, None, 201),
         # role scopes within the user's default 'user' role
-        ({}, 'self-reader', ['read:users'], 200),
+        ({}, 'self-reader', ['read:users'], 201),
         # role scopes outside of the user's role but within the group's role scopes of which the user is a member
-        ({}, 'groups-reader', ['read:groups'], 200),
+        ({}, 'groups-reader', ['read:groups'], 201),
         # non-existing role request
         ({}, 'non-existing', [], 404),
         # role scopes outside of both user's role and group's role scopes
@@ -852,7 +861,7 @@ async def test_server_token_role(app):
     [
         ('server', 'post', 'activity', 'same_user', 200),
         ('server', 'post', 'activity', 'other_user', 404),
-        ('server', 'get', 'users', 'same_user', 200),
+        ('server', 'get', 'users', 'same_user', 403),
         ('token', 'post', 'activity', 'same_user', 200),
         ('no_role', 'post', 'activity', 'same_user', 403),
     ],
@@ -875,7 +884,7 @@ async def test_server_role_api_calls(
         username = 'otheruser'
 
     if api_endpoint == 'activity':
-        path = "users/{}/activity".format(username)
+        path = f"users/{username}/activity"
         data = json.dumps({"servers": {"": {"last_activity": utcnow().isoformat()}}})
     elif api_endpoint == 'users':
         path = "users"
@@ -884,22 +893,11 @@ async def test_server_role_api_calls(
     r = await api_request(
         app,
         path,
-        headers={"Authorization": "token {}".format(api_token)},
+        headers={"Authorization": f"token {api_token}"},
         data=data,
         method=api_method,
     )
     assert r.status_code == response
-
-    if api_endpoint == 'users' and token_role == 'server':
-        reply = r.json()
-        assert len(reply) == 1
-
-        user_model = reply[0]
-        assert user_model['name'] == username
-        assert 'last_activity' in user_model.keys()
-        assert (
-            all(key for key in ['groups', 'roles', 'servers']) not in user_model.keys()
-        )
 
 
 async def test_oauth_allowed_roles(app, create_temp_role):
@@ -938,7 +936,7 @@ async def test_user_group_roles(app, create_temp_role):
 
     group_role = orm.Role.find(app.db, 'student-a')
     if not group_role:
-        create_temp_role(['read:groups!group=A'], 'student-a')
+        create_temp_role(['read:groups!group=A', 'list:groups!group=A'], 'student-a')
         roles.grant_role(app.db, group, rolename='student-a')
         group_role = orm.Role.find(app.db, 'student-a')
 
@@ -954,16 +952,16 @@ async def test_user_group_roles(app, create_temp_role):
     token = user.new_api_token()
 
     headers = {'Authorization': 'token %s' % token}
-    r = await api_request(app, 'users', method='get', headers=headers)
+    r = await api_request(app, f'users/{user.name}', method='get', headers=headers)
     assert r.status_code == 200
     r.raise_for_status()
     reply = r.json()
 
     print(reply)
 
-    assert len(reply[0]['roles']) == 1
-    assert reply[0]['name'] == 'jack'
-    assert group_role.name not in reply[0]['roles']
+    assert reply['name'] == 'jack'
+    assert len(reply['roles']) == 1
+    assert group_role.name not in reply['roles']
 
     headers = {'Authorization': 'token %s' % token}
     r = await api_request(app, 'groups', method='get', headers=headers)
@@ -972,18 +970,20 @@ async def test_user_group_roles(app, create_temp_role):
     reply = r.json()
 
     print(reply)
+    assert len(reply) == 1
+    assert reply[0]['name'] == 'A'
 
     headers = {'Authorization': 'token %s' % token}
-    r = await api_request(app, 'users', method='get', headers=headers)
+    r = await api_request(app, f'users/{user.name}', method='get', headers=headers)
     assert r.status_code == 200
     r.raise_for_status()
     reply = r.json()
 
     print(reply)
 
-    assert len(reply[0]['roles']) == 1
-    assert reply[0]['name'] == 'jack'
-    assert group_role.name not in reply[0]['roles']
+    assert reply['name'] == 'jack'
+    assert len(reply['roles']) == 1
+    assert group_role.name not in reply['roles']
 
 
 async def test_config_role_list():
@@ -1332,3 +1332,19 @@ async def test_token_keep_roles_on_restart():
     for token in user.api_tokens:
         hub.db.delete(token)
     hub.db.commit()
+
+
+async def test_login_default_role(app, username):
+    cookies = await app.login_user(username)
+    user = app.users[username]
+    # assert login new user gets 'user' role
+    assert [role.name for role in user.roles] == ["user"]
+
+    # clear roles, keep user
+    user.roles = []
+    app.db.commit()
+
+    # login *again*; user exists, shouldn't trigger change in roles
+    cookies = await app.login_user(username)
+    user = app.users[username]
+    assert user.roles == []

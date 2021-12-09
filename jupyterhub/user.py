@@ -26,9 +26,39 @@ from .metrics import RUNNING_SERVERS
 from .metrics import TOTAL_USERS
 from .objects import Server
 from .spawner import LocalProcessSpawner
+from .utils import AnyTimeoutError
 from .utils import make_ssl_context
 from .utils import maybe_future
 from .utils import url_path_join
+
+
+# detailed messages about the most common failure-to-start errors,
+# which manifest timeouts during start
+start_timeout_message = """
+Common causes of this timeout, and debugging tips:
+
+1. Everything is working, but it took too long.
+   To fix: increase `Spawner.start_timeout` configuration
+   to a number of seconds that is enough for spawners to finish starting.
+2. The server didn't finish starting,
+   or it crashed due to a configuration issue.
+   Check the single-user server's logs for hints at what needs fixing.
+"""
+
+http_timeout_message = """
+Common causes of this timeout, and debugging tips:
+
+1. The server didn't finish starting,
+   or it crashed due to a configuration issue.
+   Check the single-user server's logs for hints at what needs fixing.
+2. The server started, but is not accessible at the specified URL.
+   This may be a configuration issue specific to your chosen Spawner.
+   Check the single-user server logs and resource to make sure the URL
+   is correct and accessible from the Hub.
+3. (unlikely) Everything is working, but the server took too long to respond.
+   To fix: increase `Spawner.http_timeout` configuration
+   to a number of seconds that is enough for servers to become responsive.
+"""
 
 
 class UserDict(dict):
@@ -84,7 +114,7 @@ class UserDict(dict):
                 if user.name == key:
                     key = user.id
                     break
-        return dict.__contains__(self, key)
+        return super().__contains__(key)
 
     def __getitem__(self, key):
         """UserDict allows retrieval of user by any of:
@@ -108,7 +138,7 @@ class UserDict(dict):
             if orm_user.id not in self:
                 user = self[orm_user.id] = User(orm_user, self.settings)
                 return user
-            user = dict.__getitem__(self, orm_user.id)
+            user = super().__getitem__(orm_user.id)
             user.db = self.db
             return user
         elif isinstance(key, int):
@@ -119,7 +149,7 @@ class UserDict(dict):
                     raise KeyError("No such user: %s" % id)
                 user = self.add(orm_user)
             else:
-                user = dict.__getitem__(self, id)
+                user = super().__getitem__(id)
             return user
         else:
             raise KeyError(repr(key))
@@ -145,7 +175,7 @@ class UserDict(dict):
                 self.db.expunge(orm_spawner)
         if user.orm_user in self.db:
             self.db.expunge(user.orm_user)
-        dict.__delitem__(self, user.id)
+        super().__delitem__(user.id)
 
     def delete(self, key):
         """Delete a user from the cache and the database"""
@@ -328,7 +358,7 @@ class User:
         # self.escaped_name may contain @ which is legal in URLs but not cookie keys
         client_id = 'jupyterhub-user-%s' % quote(self.name)
         if server_name:
-            client_id = '%s-%s' % (client_id, quote(server_name))
+            client_id = f'{client_id}-{quote(server_name)}'
 
         trusted_alt_names = []
         trusted_alt_names.extend(self.settings.get('trusted_alt_names', []))
@@ -452,7 +482,7 @@ class User:
         """Get the *host* for my server (proto://domain[:port])"""
         # FIXME: escaped_name probably isn't escaped enough in general for a domain fragment
         parsed = urlparse(self.settings['subdomain_host'])
-        h = '%s://%s' % (parsed.scheme, self.domain)
+        h = f'{parsed.scheme}://{self.domain}'
         if parsed.port:
             h += ':%i' % parsed.port
         return h
@@ -464,7 +494,7 @@ class User:
         Full name.domain/path if using subdomains, otherwise just my /base/url
         """
         if self.settings.get('subdomain_host'):
-            return '{host}{path}'.format(host=self.host, path=self.base_url)
+            return f'{self.host}{self.base_url}'
         else:
             return self.base_url
 
@@ -533,9 +563,7 @@ class User:
         else:
             # spawn via POST or on behalf of another user.
             # nothing we can do here but fail
-            raise web.HTTPError(
-                400, "{}'s authentication has expired".format(self.name)
-            )
+            raise web.HTTPError(400, f"{self.name}'s authentication has expired")
 
     async def spawn(self, server_name='', options=None, handler=None):
         """Start the user's spawner
@@ -709,11 +737,11 @@ class User:
                     db.commit()
 
         except Exception as e:
-            if isinstance(e, gen.TimeoutError):
+            if isinstance(e, AnyTimeoutError):
                 self.log.warning(
-                    "{user}'s server failed to start in {s} seconds, giving up".format(
-                        user=self.name, s=spawner.start_timeout
-                    )
+                    f"{self.name}'s server failed to start"
+                    f" in {spawner.start_timeout} seconds, giving up."
+                    f"\n{start_timeout_message}"
                 )
                 e.reason = 'timeout'
                 self.settings['statsd'].incr('spawner.failure.timeout')
@@ -766,14 +794,11 @@ class User:
                 http=True, timeout=spawner.http_timeout, ssl_context=ssl_context
             )
         except Exception as e:
-            if isinstance(e, TimeoutError):
+            if isinstance(e, AnyTimeoutError):
                 self.log.warning(
-                    "{user}'s server never showed up at {url} "
-                    "after {http_timeout} seconds. Giving up".format(
-                        user=self.name,
-                        url=server.url,
-                        http_timeout=spawner.http_timeout,
-                    )
+                    f"{self.name}'s server never showed up at {server.url}"
+                    f" after {spawner.http_timeout} seconds. Giving up."
+                    f"\n{http_timeout_message}"
                 )
                 e.reason = 'timeout'
                 self.settings['statsd'].incr('spawner.failure.http_timeout')

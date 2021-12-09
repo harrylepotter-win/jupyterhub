@@ -190,9 +190,9 @@ class OAuthAuthorizeHandler(OAuthHandler, BaseHandler):
         .. versionadded: 1.1
         """
         # get the oauth client ids for the user's own server(s)
-        own_oauth_client_ids = set(
+        own_oauth_client_ids = {
             spawner.oauth_client_id for spawner in user.spawners.values()
-        )
+        }
         if (
             # it's the user's own server
             oauth_client.identifier in own_oauth_client_ids
@@ -308,12 +308,14 @@ class OAuthAuthorizeHandler(OAuthHandler, BaseHandler):
                         "filter": "",
                     }
                 ]
-            elif 'all' in raw_scopes:
-                raw_scopes = ['all']
+            elif 'inherit' in raw_scopes:
+                raw_scopes = ['inherit']
                 scope_descriptions = [
                     {
-                        "scope": "all",
-                        "description": scopes.scope_definitions['all']['description'],
+                        "scope": "inherit",
+                        "description": scopes.scope_definitions['inherit'][
+                            'description'
+                        ],
                         "filter": "",
                     }
                 ]

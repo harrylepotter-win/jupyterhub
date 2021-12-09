@@ -23,12 +23,12 @@ from operator import itemgetter
 
 from async_generator import aclosing
 from sqlalchemy.exc import SQLAlchemyError
+from tornado import gen
 from tornado import ioloop
 from tornado import web
 from tornado.httpclient import AsyncHTTPClient
 from tornado.httpclient import HTTPError
 from tornado.log import app_log
-from tornado.platform.asyncio import to_asyncio_future
 
 # For compatibility with python versions 3.6 or earlier.
 # asyncio.Task.all_tasks() is fully moved to asyncio.all_tasks() starting with 3.9. Also applies to current_task.
@@ -77,7 +77,7 @@ def can_connect(ip, port):
         ip = '127.0.0.1'
     try:
         socket.create_connection((ip, port)).close()
-    except socket.error as e:
+    except OSError as e:
         if e.errno not in {errno.ECONNREFUSED, errno.ETIMEDOUT}:
             app_log.error("Unexpected error connecting to %s:%i %s", ip, port, e)
         return False
@@ -95,6 +95,10 @@ def make_ssl_context(keyfile, certfile, cafile=None, verify=True, check_hostname
     ssl_context.load_cert_chain(certfile, keyfile)
     ssl_context.check_hostname = check_hostname
     return ssl_context
+
+
+# AnyTimeoutError catches TimeoutErrors coming from asyncio, tornado, stdlib
+AnyTimeoutError = (gen.TimeoutError, asyncio.TimeoutError, TimeoutError)
 
 
 async def exponential_backoff(
@@ -182,7 +186,7 @@ async def exponential_backoff(
         if dt < max_wait:
             scale *= scale_factor
         await asyncio.sleep(dt)
-    raise TimeoutError(fail_message)
+    raise asyncio.TimeoutError(fail_message)
 
 
 async def wait_for_server(ip, port, timeout=10):
@@ -225,7 +229,7 @@ async def wait_for_http_server(url, timeout=10, ssl_context=None):
             else:
                 app_log.debug("Server at %s responded with %s", url, e.code)
                 return e.response
-        except (OSError, socket.error) as e:
+        except OSError as e:
             if e.errno not in {
                 errno.ECONNABORTED,
                 errno.ECONNREFUSED,
@@ -286,6 +290,31 @@ def authenticated_403(self):
     """
     if self.current_user is None:
         raise web.HTTPError(403)
+
+
+def admin_only(f):
+    """Deprecated!"""
+    # write it this way to trigger deprecation warning at decoration time,
+    # not on the method call
+    warnings.warn(
+        """@jupyterhub.utils.admin_only is deprecated in JupyterHub 2.0.
+
+        Use the new `@jupyterhub.scopes.needs_scope` decorator to resolve permissions,
+        or check against `self.current_user.parsed_scopes`.
+        """,
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
+    # the original decorator
+    @auth_decorator
+    def admin_only(self):
+        """Decorator for restricting access to admin users"""
+        user = self.current_user
+        if user is None or not user.admin:
+            raise web.HTTPError(403)
+
+    return admin_only(f)
 
 
 @auth_decorator
@@ -602,7 +631,7 @@ def _parse_accept_header(accept):
                 media_params.append(('vendor', vnd))
                 # and re-write media_type to something like application/json so
                 # it can be used usefully when looking up emitters
-                media_type = '{}/{}'.format(typ, extra)
+                media_type = f'{typ}/{extra}'
 
         q = 1.0
         for part in parts:

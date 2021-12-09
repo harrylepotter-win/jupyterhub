@@ -87,10 +87,10 @@ from .user import UserDict
 from .oauth.provider import make_provider
 from ._data import DATA_FILES_PATH
 from .log import CoroutineLogFormatter, log_request
-from .pagination import Pagination
 from .proxy import Proxy, ConfigurableHTTPProxy
 from .traitlets import URLPrefix, Command, EntryPointType, Callable
 from .utils import (
+    AnyTimeoutError,
     catch_db_error,
     maybe_future,
     url_path_join,
@@ -296,7 +296,7 @@ class JupyterHub(Application):
 
     @default('classes')
     def _load_classes(self):
-        classes = [Spawner, Authenticator, CryptKeeper, Pagination]
+        classes = [Spawner, Authenticator, CryptKeeper]
         for name, trait in self.traits(config=True).items():
             # load entry point groups into configurable class list
             # so that they show up in config files, etc.
@@ -791,6 +791,16 @@ class JupyterHub(Application):
             self.proxy_api_ip or '127.0.0.1', self.proxy_api_port or self.port + 1
         )
 
+    forwarded_host_header = Unicode(
+        '',
+        help="""Alternate header to use as the Host (e.g., X-Forwarded-Host)
+        when determining whether a request is cross-origin
+
+        This may be useful when JupyterHub is running behind a proxy that rewrites
+        the Host header.
+        """,
+    ).tag(config=True)
+
     hub_port = Integer(
         8081,
         help="""The internal port for the Hub process.
@@ -1035,7 +1045,7 @@ class JupyterHub(Application):
 
     api_page_max_limit = Integer(
         200, help="The maximum amount of records that can be returned at once"
-    )
+    ).tag(config=True)
 
     authenticate_prometheus = Bool(
         True, help="Authentication for prometheus metrics"
@@ -1519,6 +1529,25 @@ class JupyterHub(Application):
         """,
     ).tag(config=True)
 
+    use_legacy_stopped_server_status_code = Bool(
+        False,
+        help="""
+        Return 503 rather than 424 when request comes in for a non-running server.
+
+        Prior to JupyterHub 2.0, we returned a 503 when any request came in for
+        a user server that was currently not running. By default, JupyterHub 2.0
+        will return a 424 - this makes operational metric dashboards more useful.
+
+        JupyterLab < 3.2 expected the 503 to know if the user server is no longer
+        running, and prompted the user to start their server. Set this config to
+        true to retain the old behavior, so JupyterLab < 3.2 can continue to show
+        the appropriate UI when the user server is stopped.
+
+        This option will be removed in a future release.
+        """,
+        config=True,
+    )
+
     def init_handlers(self):
         h = []
         # load handlers from the authenticator
@@ -1867,12 +1896,6 @@ class JupyterHub(Application):
             if not self.authenticator.validate_username(username):
                 raise ValueError("username %r is not valid" % username)
 
-        if not admin_users:
-            self.log.warning("No admin users, admin interface will be unavailable.")
-            self.log.warning(
-                "Add any administrative users to `c.Authenticator.admin_users` in config."
-            )
-
         new_users = []
 
         for name in admin_users:
@@ -2057,7 +2080,7 @@ class JupyterHub(Application):
                 if role_spec['name'] == 'admin':
                     app_log.warning(
                         "Configuration specifies both admin_users and users in the admin role specification. "
-                        "If admin role is present in config, c.authenticator.admin_users should not be used."
+                        "If admin role is present in config, c.Authenticator.admin_users should not be used."
                     )
                     app_log.info(
                         "Merging admin_users set with users list in admin role"
@@ -2096,7 +2119,7 @@ class JupyterHub(Application):
                                 )
                         Class = orm.get_class(kind)
                         orm_obj = Class.find(db, bname)
-                        if orm_obj:
+                        if orm_obj is not None:
                             orm_role_bearers.append(orm_obj)
                         else:
                             app_log.info(
@@ -2105,6 +2128,11 @@ class JupyterHub(Application):
                             if kind == 'users':
                                 orm_obj = await self._get_or_create_user(bname)
                                 orm_role_bearers.append(orm_obj)
+                            elif kind == 'groups':
+                                group = orm.Group(name=bname)
+                                db.add(group)
+                                db.commit()
+                                orm_role_bearers.append(group)
                             else:
                                 raise ValueError(
                                     f"{kind} {bname} defined in config role definition {predef_role['name']} but not present in database"
@@ -2208,7 +2236,7 @@ class JupyterHub(Application):
         """
         # this should be all the subclasses of Expiring
         for cls in (orm.APIToken, orm.OAuthCode):
-            self.log.debug("Purging expired {name}s".format(name=cls.__name__))
+            self.log.debug(f"Purging expired {cls.__name__}s")
             cls.purge_expired(self.db)
 
     async def init_api_tokens(self):
@@ -2232,7 +2260,7 @@ class JupyterHub(Application):
         if self.domain:
             domain = 'services.' + self.domain
             parsed = urlparse(self.subdomain_host)
-            host = '%s://services.%s' % (parsed.scheme, parsed.netloc)
+            host = f'{parsed.scheme}://services.{parsed.netloc}'
         else:
             domain = host = ''
 
@@ -2338,7 +2366,7 @@ class JupyterHub(Application):
                 continue
             try:
                 await Server.from_orm(service.orm.server).wait_up(timeout=1, http=True)
-            except TimeoutError:
+            except AnyTimeoutError:
                 self.log.warning(
                     "Cannot connect to %s service %s at %s",
                     service.kind,
@@ -2359,14 +2387,12 @@ class JupyterHub(Application):
 
         def _user_summary(user):
             """user is an orm.User, not a full user"""
-            parts = ['{0: >8}'.format(user.name)]
+            parts = [f'{user.name: >8}']
             if user.admin:
                 parts.append('admin')
             for name, spawner in sorted(user.orm_spawners.items(), key=itemgetter(0)):
                 if spawner.server:
-                    parts.append(
-                        '%s:%s running at %s' % (user.name, name, spawner.server)
-                    )
+                    parts.append(f'{user.name}:{name} running at {spawner.server}')
             return ' '.join(parts)
 
         async def user_stopped(user, server_name):
@@ -2418,7 +2444,7 @@ class JupyterHub(Application):
                 )
                 try:
                     await user._wait_up(spawner)
-                except TimeoutError:
+                except AnyTimeoutError:
                     self.log.error(
                         "%s does not appear to be running at %s, shutting it down.",
                         spawner._log_name,
@@ -2596,6 +2622,8 @@ class JupyterHub(Application):
             activity_resolution=self.activity_resolution,
             admin_users=self.authenticator.admin_users,
             admin_access=self.admin_access,
+            api_page_default_limit=self.api_page_default_limit,
+            api_page_max_limit=self.api_page_max_limit,
             authenticator=self.authenticator,
             spawner_class=self.spawner_class,
             base_url=self.base_url,
@@ -2701,7 +2729,7 @@ class JupyterHub(Application):
             self.log.warning(
                 "Use JupyterHub in config, not JupyterHubApp. Outdated config:\n%s",
                 '\n'.join(
-                    'JupyterHubApp.{key} = {value!r}'.format(key=key, value=value)
+                    f'JupyterHubApp.{key} = {value!r}'
                     for key, value in self.config.JupyterHubApp.items()
                 ),
             )
@@ -2723,7 +2751,7 @@ class JupyterHub(Application):
                 mod = sys.modules.get(cls.__module__.split('.')[0])
                 version = getattr(mod, '__version__', '')
                 if version:
-                    version = '-{}'.format(version)
+                    version = f'-{version}'
             else:
                 version = ''
             self.log.info(
@@ -2780,7 +2808,7 @@ class JupyterHub(Application):
             await gen.with_timeout(
                 timedelta(seconds=max(init_spawners_timeout, 1)), init_spawners_future
             )
-        except gen.TimeoutError:
+        except AnyTimeoutError:
             self.log.warning(
                 "init_spawners did not complete within %i seconds. "
                 "Allowing to complete in the background.",
@@ -3023,11 +3051,7 @@ class JupyterHub(Application):
 
         # start the service(s)
         for service_name, service in self._service_map.items():
-            msg = (
-                '%s at %s' % (service_name, service.url)
-                if service.url
-                else service_name
-            )
+            msg = f'{service_name} at {service.url}' if service.url else service_name
             if service.managed:
                 self.log.info("Starting managed service %s", msg)
                 try:
@@ -3047,7 +3071,7 @@ class JupyterHub(Application):
                         await Server.from_orm(service.orm.server).wait_up(
                             http=True, timeout=1, ssl_context=ssl_context
                         )
-                    except TimeoutError:
+                    except AnyTimeoutError:
                         if service.managed:
                             status = await service.spawner.poll()
                             if status is not None:

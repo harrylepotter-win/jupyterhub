@@ -2,7 +2,12 @@
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 import json
+from functools import lru_cache
 from http.client import responses
+from urllib.parse import parse_qs
+from urllib.parse import urlencode
+from urllib.parse import urlparse
+from urllib.parse import urlunparse
 
 from sqlalchemy.exc import SQLAlchemyError
 from tornado import web
@@ -11,6 +16,8 @@ from .. import orm
 from ..handlers import BaseHandler
 from ..utils import isoformat
 from ..utils import url_path_join
+
+PAGINATION_MEDIA_TYPE = "application/jupyterhub-pagination+json"
 
 
 class APIHandler(BaseHandler):
@@ -24,12 +31,25 @@ class APIHandler(BaseHandler):
     - methods for REST API models
     """
 
+    # accept token-based authentication for API requests
+    _accept_token_auth = True
+
     @property
     def content_security_policy(self):
         return '; '.join([super().content_security_policy, "default-src 'none'"])
 
     def get_content_type(self):
         return 'application/json'
+
+    @property
+    @lru_cache()
+    def accepts_pagination(self):
+        """Return whether the client accepts the pagination preview media type"""
+        accept_header = self.request.headers.get("Accept", "")
+        if not accept_header:
+            return False
+        accepts = {s.strip().lower() for s in accept_header.strip().split(",")}
+        return PAGINATION_MEDIA_TYPE in accepts
 
     def check_referer(self):
         """Check Origin for cross-site API requests.
@@ -38,7 +58,8 @@ class APIHandler(BaseHandler):
 
         - allow unspecified host/referer (e.g. scripts)
         """
-        host = self.request.headers.get("Host")
+        host_header = self.app.forwarded_host_header or "Host"
+        host = self.request.headers.get(host_header)
         referer = self.request.headers.get("Referer")
 
         # If no header is provided, assume it comes from a script/curl.
@@ -50,25 +71,61 @@ class APIHandler(BaseHandler):
             self.log.warning("Blocking API request with no referer")
             return False
 
-        host_path = url_path_join(host, self.hub.base_url)
-        referer_path = referer.split('://', 1)[-1]
-        if not (referer_path + '/').startswith(host_path):
+        proto = self.request.protocol
+        full_host = f"{proto}://{host}{self.hub.base_url}"
+        host_url = urlparse(full_host)
+        referer_url = urlparse(referer)
+        # resolve default ports for http[s]
+        referer_port = referer_url.port or (
+            443 if referer_url.scheme == 'https' else 80
+        )
+        host_port = host_url.port or (443 if host_url.scheme == 'https' else 80)
+        if (
+            referer_url.scheme != host_url.scheme
+            or referer_url.hostname != host_url.hostname
+            or referer_port != host_port
+            or not (referer_url.path + "/").startswith(host_url.path)
+        ):
             self.log.warning(
-                "Blocking Cross Origin API request.  Referer: %s, Host: %s",
-                referer,
-                host_path,
+                f"Blocking Cross Origin API request.  Referer: {referer},"
+                " {host_header}: {host}, Host URL: {full_host}",
             )
             return False
         return True
 
+    def check_post_content_type(self):
+        """Check request content-type, e.g. for cross-site POST requests
+
+        Cross-site POST via form will include content-type
+        """
+        content_type = self.request.headers.get("Content-Type")
+        if not content_type:
+            # not specified, e.g. from a script
+            return True
+
+        # parse content type for application/json
+        fields = content_type.lower().split(";")
+        if not any(f.lstrip().startswith("application/json") for f in fields):
+            self.log.warning(f"Not allowing POST with content-type: {content_type}")
+            return False
+
+        return True
+
     def get_current_user_cookie(self):
-        """Override get_user_cookie to check Referer header"""
+        """Extend get_user_cookie to add checks for CORS"""
         cookie_user = super().get_current_user_cookie()
-        # check referer only if there is a cookie user,
+        # CORS checks for cookie-authentication
+        # check these only if there is a cookie user,
         # avoiding misleading "Blocking Cross Origin" messages
         # when there's no cookie set anyway.
-        if cookie_user and not self.check_referer():
-            return None
+        if cookie_user:
+            if not self.check_referer():
+                return None
+            if (
+                self.request.method.upper() == 'POST'
+                and not self.check_post_content_type()
+            ):
+                return None
         return cookie_user
 
     def get_json_body(self):
@@ -168,6 +225,7 @@ class APIHandler(BaseHandler):
             'last_activity': isoformat(token.last_activity),
             'expires_at': isoformat(token.expires_at),
             'note': token.note,
+            'session_id': token.session_id,
             'oauth_client': token.oauth_client.description
             or token.oauth_client.identifier,
         }
@@ -342,8 +400,13 @@ class APIHandler(BaseHandler):
                 )
 
     def get_api_pagination(self):
-        default_limit = self.settings["app"].api_page_default_limit
-        max_limit = self.settings["app"].api_page_max_limit
+        default_limit = self.settings["api_page_default_limit"]
+        max_limit = self.settings["api_page_max_limit"]
+        if not self.accepts_pagination:
+            # if new pagination Accept header is not used,
+            # default to the higher max page limit to reduce likelihood
+            # of missing users due to pagination in code that hasn't been updated
+            default_limit = max_limit
         offset = self.get_argument("offset", None)
         limit = self.get_argument("limit", default_limit)
         try:
@@ -351,11 +414,51 @@ class APIHandler(BaseHandler):
             limit = abs(int(limit))
             if limit > max_limit:
                 limit = max_limit
+            if limit < 1:
+                limit = 1
         except Exception as e:
             raise web.HTTPError(
                 400, "Invalid argument type, offset and limit must be integers"
             )
         return offset, limit
+
+    def paginated_model(self, items, offset, limit, total_count):
+        """Return the paginated form of a collection (list or dict)
+
+        A dict with { items: [], _pagination: {}}
+        instead of a single list (or dict).
+
+        pagination info includes the current offset and limit,
+        the total number of results for the query,
+        and information about how to build the next page request
+        if there is one.
+        """
+        next_offset = offset + limit
+        data = {
+            "items": items,
+            "_pagination": {
+                "offset": offset,
+                "limit": limit,
+                "total": total_count,
+                "next": None,
+            },
+        }
+        if next_offset < total_count:
+            # if there's a next page
+            next_url_parsed = urlparse(self.request.full_url())
+            query = parse_qs(next_url_parsed.query)
+            query['offset'] = [next_offset]
+            query['limit'] = [limit]
+            next_url_parsed = next_url_parsed._replace(
+                query=urlencode(query, doseq=True)
+            )
+            next_url = urlunparse(next_url_parsed)
+            data["_pagination"]["next"] = {
+                "offset": next_offset,
+                "limit": limit,
+                "url": next_url,
+            }
+        return data
 
     def options(self, *args, **kwargs):
         self.finish()

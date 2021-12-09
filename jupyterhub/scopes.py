@@ -30,18 +30,25 @@ scope_definitions = {
         'description': 'Your own resources',
         'doc_description': 'The user’s own resources _(metascope for users, resolves to (no_scope) for services)_',
     },
-    'all': {
+    'inherit': {
         'description': 'Anything you have access to',
         'doc_description': 'Everything that the token-owning entity can access _(metascope for tokens)_',
     },
     'admin:users': {
         'description': 'Read, write, create and delete users and their authentication state, not including their servers or tokens.',
-        'subscopes': ['admin:auth_state', 'users', 'read:roles:users'],
+        'subscopes': ['admin:auth_state', 'users', 'read:roles:users', 'delete:users'],
     },
     'admin:auth_state': {'description': 'Read a user’s authentication state.'},
     'users': {
         'description': 'Read and write permissions to user models (excluding servers, tokens and authentication state).',
-        'subscopes': ['read:users', 'users:activity'],
+        'subscopes': ['read:users', 'list:users', 'users:activity'],
+    },
+    'delete:users': {
+        'description': "Delete users.",
+    },
+    'list:users': {
+        'description': 'List users, including at least their names.',
+        'subscopes': ['read:users:name'],
     },
     'read:users': {
         'description': 'Read user models (excluding including servers, tokens and authentication state).',
@@ -72,12 +79,13 @@ scope_definitions = {
     'admin:server_state': {'description': 'Read and write users’ server state.'},
     'servers': {
         'description': 'Start and stop user servers.',
-        'subscopes': ['read:servers'],
+        'subscopes': ['read:servers', 'delete:servers'],
     },
     'read:servers': {
         'description': 'Read users’ names and their server models (excluding the server state).',
         'subscopes': ['read:users:name'],
     },
+    'delete:servers': {'description': "Stop and delete users' servers."},
     'tokens': {
         'description': 'Read, write, create and delete user tokens.',
         'subscopes': ['read:tokens'],
@@ -85,17 +93,28 @@ scope_definitions = {
     'read:tokens': {'description': 'Read user tokens.'},
     'admin:groups': {
         'description': 'Read and write group information, create and delete groups.',
-        'subscopes': ['groups', 'read:roles:groups'],
+        'subscopes': ['groups', 'read:roles:groups', 'delete:groups'],
     },
     'groups': {
         'description': 'Read and write group information, including adding/removing users to/from groups.',
-        'subscopes': ['read:groups'],
+        'subscopes': ['read:groups', 'list:groups'],
+    },
+    'list:groups': {
+        'description': 'List groups, including at least their names.',
+        'subscopes': ['read:groups:name'],
     },
     'read:groups': {
         'description': 'Read group models.',
         'subscopes': ['read:groups:name'],
     },
     'read:groups:name': {'description': 'Read group names.'},
+    'delete:groups': {
+        'description': "Delete groups.",
+    },
+    'list:services': {
+        'description': 'List services, including at least their names.',
+        'subscopes': ['read:services:name'],
+    },
     'read:services': {
         'description': 'Read service models.',
         'subscopes': ['read:services:name'],
@@ -276,7 +295,7 @@ def get_scopes_for(orm_object):
             )
 
     if isinstance(orm_object, orm.APIToken):
-        app_log.warning(f"Authenticated with token {orm_object}")
+        app_log.debug(f"Authenticated with token {orm_object}")
         owner = orm_object.user or orm_object.service
         token_scopes = roles.expand_roles_to_scopes(orm_object)
         if orm_object.client_id != "jupyterhub":
@@ -298,13 +317,13 @@ def get_scopes_for(orm_object):
 
         owner_scopes = roles.expand_roles_to_scopes(owner)
 
-        if token_scopes == {'all'}:
-            # token_scopes is only 'all', return owner scopes as-is
+        if token_scopes == {'inherit'}:
+            # token_scopes is only 'inherit', return scopes inherited from owner as-is
             # short-circuit common case where we don't need to compute an intersection
             return owner_scopes
 
-        if 'all' in token_scopes:
-            token_scopes.remove('all')
+        if 'inherit' in token_scopes:
+            token_scopes.remove('inherit')
             token_scopes |= owner_scopes
 
         intersection = _intersect_expanded_scopes(
@@ -422,7 +441,7 @@ def parse_scopes(scope_list):
         if parsed_scopes[base_scope] != Scope.ALL:
             key, _, value = filter_.partition('=')
             if key not in parsed_scopes[base_scope]:
-                parsed_scopes[base_scope][key] = set([value])
+                parsed_scopes[base_scope][key] = {value}
             else:
                 parsed_scopes[base_scope][key].add(value)
     return parsed_scopes

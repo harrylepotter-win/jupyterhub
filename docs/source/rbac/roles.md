@@ -1,3 +1,5 @@
+(roles)=
+
 # Roles
 
 JupyterHub provides four roles that are available by default:
@@ -121,13 +123,13 @@ has,
 define the `server` role.
 
 To restore the JupyterHub 1.x behavior of servers being able to do anything their owners can do,
-use the scope `all`:
+use the scope `inherit` (for 'inheriting' the owner's permissions):
 
 ```python
 c.JupyterHub.load_roles = [
  {
    'name': 'server',
-   'scopes': ['all'],
+   'scopes': ['inherit'],
  }
 ]
 ```

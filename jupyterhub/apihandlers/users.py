@@ -10,6 +10,7 @@ from datetime import timezone
 from async_generator import aclosing
 from dateutil.parser import parse as parse_date
 from sqlalchemy import func
+from sqlalchemy import or_
 from tornado import web
 from tornado.iostream import StreamClosedError
 
@@ -57,6 +58,14 @@ class SelfAPIHandler(APIHandler):
 
         model = get_model(user)
 
+        # add session_id associated with token
+        # added in 2.0
+        token = self.get_token()
+        if token:
+            model["session_id"] = token.session_id
+        else:
+            model["session_id"] = None
+
         # add scopes to identify model,
         # but not the scopes we added to ensure we could read our own model
         model["scopes"] = sorted(self.expanded_scopes.difference(_added_scopes))
@@ -72,14 +81,7 @@ class UserListAPIHandler(APIHandler):
         user = self.users[orm_user]
         return any(spawner.ready for spawner in user.spawners.values())
 
-    @needs_scope(
-        'read:users',
-        'read:users:name',
-        'read:servers',
-        'read:users:groups',
-        'read:users:activity',
-        'read:roles:users',
-    )
+    @needs_scope('list:users')
     def get(self):
         state_filter = self.get_argument("state", None)
         offset, limit = self.get_api_pagination()
@@ -123,14 +125,49 @@ class UserListAPIHandler(APIHandler):
             # no filter, return all users
             query = self.db.query(orm.User)
 
-        query = query.offset(offset).limit(limit)
+        sub_scope = self.parsed_scopes['list:users']
+        if sub_scope != scopes.Scope.ALL:
+            if not set(sub_scope).issubset({'group', 'user'}):
+                # don't expand invalid !server=x filter to all users!
+                self.log.warning(
+                    "Invalid filter on list:user for {self.current_user}: {sub_scope}"
+                )
+                raise web.HTTPError(403)
+            filters = []
+            if 'user' in sub_scope:
+                filters.append(orm.User.name.in_(sub_scope['user']))
+            if 'group' in sub_scope:
+                filters.append(
+                    orm.User.groups.any(
+                        orm.Group.name.in_(sub_scope['group']),
+                    )
+                )
 
-        data = []
+            if len(filters) == 1:
+                query = query.filter(filters[0])
+            else:
+                query = query.filter(or_(*filters))
+
+        full_query = query
+        query = query.order_by(orm.User.id.asc()).offset(offset).limit(limit)
+
+        user_list = []
         for u in query:
             if post_filter is None or post_filter(u):
                 user_model = self.user_model(u)
                 if user_model:
-                    data.append(user_model)
+                    user_list.append(user_model)
+
+        total_count = full_query.count()
+        if self.accepts_pagination:
+            data = self.paginated_model(user_list, offset, limit, total_count)
+        else:
+            query_count = query.count()
+            if offset == 0 and total_count > query_count:
+                self.log.warning(
+                    f"Truncated user list in request that does not expect pagination. Processing {query_count} of {total_count} total users."
+                )
+            data = user_list
 
         self.write(json.dumps(data))
 
@@ -181,9 +218,7 @@ class UserListAPIHandler(APIHandler):
             except Exception as e:
                 self.log.error("Failed to create user: %s" % name, exc_info=True)
                 self.users.delete(user)
-                raise web.HTTPError(
-                    400, "Failed to create user %s: %s" % (name, str(e))
-                )
+                raise web.HTTPError(400, f"Failed to create user {name}: {e}")
             else:
                 created.append(user)
 
@@ -239,7 +274,7 @@ class UserAPIHandler(APIHandler):
         self.write(json.dumps(self.user_model(user)))
         self.set_status(201)
 
-    @needs_scope('admin:users')
+    @needs_scope('delete:users')
     async def delete(self, user_name):
         user = self.find_user(user_name)
         if user is None:
@@ -365,14 +400,16 @@ class UserTokenListAPIHandler(APIHandler):
         if not note:
             note = "Requested via api"
             if requester is not user:
-                note += " by %s %s" % (kind, requester.name)
+                note += f" by {kind} {requester.name}"
 
         token_roles = body.get('roles')
         try:
             api_token = user.new_api_token(
-                note=note, expires_in=body.get('expires_in', None), roles=token_roles
+                note=note,
+                expires_in=body.get('expires_in', None),
+                roles=token_roles,
             )
-        except NameError:
+        except KeyError:
             raise web.HTTPError(404, "Requested roles %r not found" % token_roles)
         except ValueError:
             raise web.HTTPError(
@@ -394,6 +431,7 @@ class UserTokenListAPIHandler(APIHandler):
         token_model = self.token_model(orm.APIToken.find(self.db, api_token))
         token_model['token'] = api_token
         self.write(json.dumps(token_model))
+        self.set_status(201)
 
 
 class UserTokenAPIHandler(APIHandler):
@@ -405,7 +443,7 @@ class UserTokenAPIHandler(APIHandler):
         Raises 404 if not found for any reason
         (e.g. wrong owner, invalid key format, etc.)
         """
-        not_found = "No such token %s for user %s" % (token_id, user.name)
+        not_found = f"No such token {token_id} for user {user.name}"
         prefix, id_ = token_id[:1], token_id[1:]
         if prefix != 'a':
             raise web.HTTPError(404, not_found)
@@ -456,6 +494,11 @@ class UserServerAPIHandler(APIHandler):
     @needs_scope('servers')
     async def post(self, user_name, server_name=''):
         user = self.find_user(user_name)
+        if user is None:
+            # this can be reached if a token has `servers`
+            # permission on *all* users
+            raise web.HTTPError(404)
+
         if server_name:
             if not self.allow_named_servers:
                 raise web.HTTPError(400, "Named servers are not enabled.")
@@ -479,7 +522,7 @@ class UserServerAPIHandler(APIHandler):
             self.set_status(202)
             return
         elif pending:
-            raise web.HTTPError(400, "%s is pending %s" % (spawner._log_name, pending))
+            raise web.HTTPError(400, f"{spawner._log_name} is pending {pending}")
 
         if spawner.ready:
             # include notify, so that a server that died is noticed immediately
@@ -498,7 +541,7 @@ class UserServerAPIHandler(APIHandler):
         self.set_header('Content-Type', 'text/plain')
         self.set_status(status)
 
-    @needs_scope('servers')
+    @needs_scope('delete:servers')
     async def delete(self, user_name, server_name=''):
         user = self.find_user(user_name)
         options = self.get_json_body()
@@ -525,7 +568,7 @@ class UserServerAPIHandler(APIHandler):
                 raise web.HTTPError(400, "Named servers are not enabled.")
             if server_name not in user.orm_spawners:
                 raise web.HTTPError(
-                    404, "%s has no server named '%s'" % (user_name, server_name)
+                    404, f"{user_name} has no server named '{server_name}'"
                 )
         elif remove:
             raise web.HTTPError(400, "Cannot delete the default server")
@@ -543,7 +586,7 @@ class UserServerAPIHandler(APIHandler):
         if spawner.pending:
             raise web.HTTPError(
                 400,
-                "%s is pending %s, please wait" % (spawner._log_name, spawner.pending),
+                f"{spawner._log_name} is pending {spawner.pending}, please wait",
             )
 
         stop_future = None
@@ -598,7 +641,7 @@ class SpawnProgressAPIHandler(APIHandler):
 
     async def send_event(self, event):
         try:
-            self.write('data: {}\n\n'.format(json.dumps(event)))
+            self.write(f'data: {json.dumps(event)}\n\n')
             await self.flush()
         except StreamClosedError:
             self.log.warning("Stream closed while handling %s", self.request.uri)
@@ -652,7 +695,7 @@ class SpawnProgressAPIHandler(APIHandler):
         ready_event = {
             'progress': 100,
             'ready': True,
-            'message': "Server ready at {}".format(url),
+            'message': f"Server ready at {url}",
             'html_message': 'Server ready at <a href="{0}">{0}</a>'.format(url),
             'url': url,
         }
@@ -755,7 +798,7 @@ class ActivityAPIHandler(APIHandler):
             if server_name not in spawners:
                 raise web.HTTPError(
                     400,
-                    "No such server '{}' for user {}".format(server_name, user.name),
+                    f"No such server '{server_name}' for user {user.name}",
                 )
             # check that each per-server field is a dict
             if not isinstance(server_info, dict):

@@ -56,8 +56,8 @@ async def test_root_redirect(app):
     r = await get_page(url, app, cookies=cookies)
     path = urlparse(r.url).path
     assert path == ujoin(app.base_url, 'hub/user/%s/test.ipynb' % name)
-    # serve "server not running" page, which has status 503
-    assert r.status_code == 503
+    # serve "server not running" page, which has status 424
+    assert r.status_code == 424
 
 
 async def test_root_default_url_noauth(app):
@@ -172,7 +172,7 @@ async def test_spawn_redirect(app):
     r = await get_page('user/' + name, app, hub=False, cookies=cookies)
     path = urlparse(r.url).path
     assert path == ujoin(app.base_url, 'hub/user/%s/' % name)
-    assert r.status_code == 503
+    assert r.status_code == 424
 
 
 async def test_spawn_handler_access(app):
@@ -218,7 +218,7 @@ async def test_spawn_admin_access(app, admin_access):
         r.raise_for_status()
 
     assert (r.url.split('?')[0] + '/').startswith(public_url(app, user))
-    r = await get_page('user/{}/env'.format(name), app, hub=False, cookies=cookies)
+    r = await get_page(f'user/{name}/env', app, hub=False, cookies=cookies)
 
     r.raise_for_status()
     env = r.json()
@@ -255,7 +255,7 @@ async def test_spawn_page_admin(app, admin_access):
         r = await get_page('spawn/' + u.name, app, cookies=cookies)
         assert r.url.endswith('/spawn/' + u.name)
         assert FormSpawner.options_form in r.text
-        assert "Spawning server for {}".format(u.name) in r.text
+        assert f"Spawning server for {u.name}" in r.text
 
 
 async def test_spawn_with_query_arguments(app):
@@ -507,13 +507,13 @@ async def test_user_redirect_deprecated(app, username):
     print(urlparse(r.url))
     path = urlparse(r.url).path
     assert path == ujoin(app.base_url, 'hub/user/%s/' % name)
-    assert r.status_code == 503
+    assert r.status_code == 424
 
     r = await get_page('/user/baduser/test.ipynb', app, cookies=cookies, hub=False)
     print(urlparse(r.url))
     path = urlparse(r.url).path
     assert path == ujoin(app.base_url, 'hub/user/%s/test.ipynb' % name)
-    assert r.status_code == 503
+    assert r.status_code == 424
 
     r = await get_page('/user/baduser/test.ipynb', app, hub=False)
     r.raise_for_status()
@@ -576,6 +576,41 @@ async def test_login_page(app, url, params, redirected_url, form_action):
     action = form.attrs['action']
     form_action = form_action.replace('{{BASE_URL}}', url_escape(app.base_url))
     assert action.endswith(form_action)
+
+
+@pytest.mark.parametrize(
+    "url, token_in",
+    [
+        ("/home", "url"),
+        ("/home", "header"),
+        ("/login", "url"),
+        ("/login", "header"),
+    ],
+)
+async def test_page_with_token(app, user, url, token_in):
+    cookies = await app.login_user(user.name)
+    token = user.new_api_token()
+    if token_in == "url":
+        url = url_concat(url, {"token": token})
+        headers = None
+    elif token_in == "header":
+        headers = {
+            "Authorization": f"token {token}",
+        }
+
+    # request a page with ?token= in URL shouldn't be allowed
+    r = await get_page(
+        url,
+        app,
+        headers=headers,
+        allow_redirects=False,
+    )
+    if "/hub/login" in r.url:
+        assert r.status_code == 200
+    else:
+        assert r.status_code == 302
+        assert r.headers["location"].partition("?")[0].endswith("/hub/login")
+    assert not r.cookies
 
 
 async def test_login_fail(app):
@@ -1061,11 +1096,18 @@ async def test_token_page(app):
 async def test_server_not_running_api_request(app):
     cookies = await app.login_user("bees")
     r = await get_page("user/bees/api/status", app, hub=False, cookies=cookies)
-    assert r.status_code == 503
+    assert r.status_code == 424
     assert r.headers["content-type"] == "application/json"
     message = r.json()['message']
     assert ujoin(app.base_url, "hub/spawn/bees") in message
     assert " /user/bees" in message
+
+
+async def test_server_not_running_api_request_legacy_status(app):
+    app.use_legacy_stopped_server_status_code = True
+    cookies = await app.login_user("bees")
+    r = await get_page("user/bees/api/status", app, hub=False, cookies=cookies)
+    assert r.status_code == 503
 
 
 async def test_metrics_no_auth(app):

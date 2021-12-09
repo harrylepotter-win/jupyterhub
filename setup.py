@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-# coding: utf-8
 # Copyright (c) Jupyter Development Team.
 # Distributed under the terms of the Modified BSD License.
 # -----------------------------------------------------------------------------
 # Minimal Python version sanity check (from IPython)
 # -----------------------------------------------------------------------------
-from __future__ import print_function
-
 import os
 import shutil
 import sys
@@ -49,10 +46,9 @@ def get_data_files():
     """Get data files in share/jupyter"""
 
     data_files = []
-    ntrim = len(here + os.path.sep)
-
     for (d, dirs, filenames) in os.walk(share_jupyterhub):
-        data_files.append((d[ntrim:], [pjoin(d, f) for f in filenames]))
+        rel_d = os.path.relpath(d, here)
+        data_files.append((rel_d, [os.path.join(rel_d, f) for f in filenames]))
     return data_files
 
 
@@ -103,6 +99,7 @@ setup_args = dict(
             'default = jupyterhub.auth:PAMAuthenticator',
             'pam = jupyterhub.auth:PAMAuthenticator',
             'dummy = jupyterhub.auth:DummyAuthenticator',
+            'null = jupyterhub.auth:NullAuthenticator',
         ],
         'jupyterhub.proxies': [
             'default = jupyterhub.proxy:ConfigurableHTTPProxy',
@@ -239,8 +236,8 @@ class CSS(BaseCommand):
             'lessc',
             '--',
             '--clean-css',
-            '--source-map-basepath={}'.format(static),
-            '--source-map={}'.format(sourcemap),
+            f'--source-map-basepath={static}',
+            f'--source-map={sourcemap}',
             '--source-map-rootpath=../',
             style_less,
             style_css,
@@ -304,7 +301,7 @@ class develop_js_css(develop):
         if not self.uninstall:
             self.distribution.run_command('js')
             self.distribution.run_command('css')
-        develop.run(self)
+        super().run()
 
 
 setup_args['cmdclass']['develop'] = develop_js_css
