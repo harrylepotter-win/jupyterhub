@@ -670,7 +670,7 @@ class SpawnProgressAPIHandler(APIHandler):
 
             await asyncio.wait([self._finish_future], timeout=self.keepalive_interval)
 
-    @needs_scope('read:servers')
+    #@needs_scope('read:servers')
     async def get(self, user_name, server_name=''):
         self.set_header('Cache-Control', 'no-cache')
         if server_name is None:
